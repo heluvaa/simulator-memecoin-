@@ -6,7 +6,7 @@ import time
 from datetime import datetime
 
 # Konfigurasi Token
-API_TOKEN = '8957338400:AAFvb2cLattqP6PJb-tQUoa1S6Bmd2rLdX0'
+API_TOKEN = '8633909921:AAEOsyAGO4efVNOdYA9zZrBkAN1DZw3Q2NY'
 bot = telebot.TeleBot(API_TOKEN)
 
 # Multi-User Database
