@@ -5,7 +5,12 @@ import threading
 import time
 import logging
 import os
+import io
 from datetime import datetime
+
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
 
 # ================= LOGGING (biar error kelihatan di Railway logs) =================
 logging.basicConfig(level=logging.INFO, format='%(asctime)s [%(levelname)s] %(message)s')
@@ -30,20 +35,26 @@ REQUEST_TIMEOUT = 10
 # Multi-User Database
 users_db = {}
 
+def default_user_data(username="Unknown"):
+    return {
+        'username': username,
+        'balance': 1000000.0,
+        'tp_on': True,
+        'sl_on': True,
+        'tp_pct': 50.0,
+        'sl_pct': 20.0,
+        'scanner_on': False,
+        'seen_scanner_tokens': set(),
+        'positions': {},
+        'history': [],
+        'sell_presets': [25, 50, 100],
+        'alerts': {},          # address -> list of {'id','dir','target'}
+        'alert_counter': 0,
+    }
+
 def get_user(chat_id, username="Unknown"):
     if chat_id not in users_db:
-        users_db[chat_id] = {
-            'username': username,
-            'balance': 1000000.0,
-            'tp_on': True,
-            'sl_on': True,
-            'tp_pct': 50.0,
-            'sl_pct': 20.0,
-            'scanner_on': False,
-            'seen_scanner_tokens': set(),
-            'positions': {},
-            'history': []
-        }
+        users_db[chat_id] = default_user_data(username)
     return users_db[chat_id]
 
 # Inisialisasi Menu Bawaan Telegram
@@ -51,7 +62,10 @@ bot.set_my_commands([
     BotCommand("/start", "Buka Menu Utama"),
     BotCommand("/pnl", "Cek Portofolio & Jual Beli"),
     BotCommand("/history", "Riwayat PnL"),
-    BotCommand("/scanner", "Auto Scan Token Baru")
+    BotCommand("/stats", "Statistik Trading"),
+    BotCommand("/alerts", "Lihat & Kelola Alert Harga"),
+    BotCommand("/scanner", "Auto Scan Token Baru"),
+    BotCommand("/reset", "Reset Saldo & Data")
 ])
 
 # ================= HTTP HELPERS (fix utama: header + timeout + logging) =================
@@ -86,6 +100,17 @@ def format_num(num):
     if num >= 1_000: return f"${num/1_000:.2f}K"
     return f"${num:.4f}"
 
+def format_duration(seconds):
+    seconds = int(max(seconds, 0))
+    days, seconds = divmod(seconds, 86400)
+    hours, seconds = divmod(seconds, 3600)
+    minutes, _ = divmod(seconds, 60)
+    parts = []
+    if days: parts.append(f"{days}d")
+    if hours: parts.append(f"{hours}h")
+    if minutes or not parts: parts.append(f"{minutes}m")
+    return " ".join(parts)
+
 def get_realtime_metrics_text(data):
     if not data: return "⚠️ Data real-time tidak tersedia."
     price = float(data.get('priceUsd', 0))
@@ -93,6 +118,36 @@ def get_realtime_metrics_text(data):
     fdv = data.get('fdv', 0)
     vol = data.get('volume', {}).get('h24', 0)
     return f"💵 Price: `${price:.6f}` | 📈 5m: `{change_5m}%`\n💰 FDV: `{format_num(fdv)}` | 📊 Vol 24h: `{format_num(vol)}`"
+
+def generate_price_chart(token_data, symbol):
+    """Snapshot perubahan harga (5m/1h/6h/24h) — bukan candle historis penuh,
+    karena API gratis Dexscreener tidak menyediakan OHLC historis."""
+    changes = token_data.get('priceChange', {}) or {}
+    label_map = [('m5', '5m'), ('h1', '1h'), ('h6', '6h'), ('h24', '24h')]
+    labels, values = [], []
+    for key, label in label_map:
+        if key in changes and changes[key] is not None:
+            try:
+                values.append(float(changes[key]))
+                labels.append(label)
+            except (TypeError, ValueError):
+                continue
+    if not values:
+        return None
+
+    colors = ['#22c55e' if v >= 0 else '#ef4444' for v in values]
+    fig, ax = plt.subplots(figsize=(5, 3))
+    ax.bar(labels, values, color=colors)
+    ax.axhline(0, color='gray', linewidth=0.8)
+    ax.set_title(f"${symbol} — Perubahan Harga (%)")
+    ax.set_ylabel("%")
+    fig.tight_layout()
+
+    buf = io.BytesIO()
+    fig.savefig(buf, format='png', dpi=120)
+    plt.close(fig)
+    buf.seek(0)
+    return buf
 
 # ================= PAGINATION & PNL LAYOUT =================
 
@@ -126,6 +181,8 @@ def render_pnl_page(user, page, sort_by="recent"):
         InlineKeyboardButton("📈 Sort by Profit", callback_data=f"pnlpage_0_profit")
     )
 
+    presets = user.get('sell_presets', [25, 50, 100])
+
     for address, pos in page_items:
         data = get_dexscreener_data(address)
         cur_price = float(data.get('priceUsd', 0)) if data else pos['entry_usd']
@@ -147,13 +204,17 @@ def render_pnl_page(user, page, sort_by="recent"):
             InlineKeyboardButton("➕ Custom Buy", callback_data=f"buycustom_{address}_{page}_{sort_by}")
         )
         markup.row(
-            InlineKeyboardButton("25% Sell", callback_data=f"sell_25_{address}_{page}_{sort_by}"),
-            InlineKeyboardButton("50% Sell", callback_data=f"sell_50_{address}_{page}_{sort_by}"),
-            InlineKeyboardButton("100% Sell", callback_data=f"sell_100_{address}_{page}_{sort_by}")
+            InlineKeyboardButton(f"{int(presets[0])}% Sell", callback_data=f"sell_{int(presets[0])}_{address}_{page}_{sort_by}"),
+            InlineKeyboardButton(f"{int(presets[1])}% Sell", callback_data=f"sell_{int(presets[1])}_{address}_{page}_{sort_by}"),
+            InlineKeyboardButton(f"{int(presets[2])}% Sell", callback_data=f"sell_{int(presets[2])}_{address}_{page}_{sort_by}")
+        )
+        markup.row(
+            InlineKeyboardButton("🏦 Sell Initial (Balik Modal)", callback_data=f"sinit_{address}_{page}_{sort_by}")
         )
 
     nav_buttons = []
     if page > 0: nav_buttons.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"pnlpage_{page - 1}_{sort_by}"))
+    nav_buttons.append(InlineKeyboardButton("🔄 Refresh", callback_data=f"pnlrefresh_{page}_{sort_by}"))
     if page < total_pages - 1: nav_buttons.append(InlineKeyboardButton("Next ➡️", callback_data=f"pnlpage_{page + 1}_{sort_by}"))
     if nav_buttons: markup.row(*nav_buttons)
 
@@ -165,8 +226,56 @@ def render_main_menu(user):
     scanner_label = "📡 Scanner: ON ✅" if user['scanner_on'] else "📡 Scanner: OFF"
     markup.row(InlineKeyboardButton("💼 Portofolio / PnL", callback_data="menu_pnl"), InlineKeyboardButton("📜 History", callback_data="menu_history"))
     markup.row(InlineKeyboardButton(scanner_label, callback_data="toggle_scanner"), InlineKeyboardButton("🔥 Top 10 Trending", callback_data="menu_trending"))
-    markup.row(InlineKeyboardButton("🏆 Leaderboard", callback_data="menu_leaderboard"), InlineKeyboardButton("📖 Cara Pakai", callback_data="help_usage"))
+    markup.row(InlineKeyboardButton("🏆 Leaderboard", callback_data="menu_leaderboard"), InlineKeyboardButton("📊 Statistik", callback_data="menu_stats"))
     markup.row(InlineKeyboardButton(f"⚙️ Auto TP ({user['tp_pct']}%)", callback_data="menu_settp"), InlineKeyboardButton(f"⚙️ Auto SL ({user['sl_pct']}%)", callback_data="menu_setsl"))
+    markup.row(InlineKeyboardButton("🎚 Preset Jual", callback_data="menu_presets"), InlineKeyboardButton("🔔 Alert Aktif", callback_data="menu_alerts"))
+    markup.row(InlineKeyboardButton("📖 Cara Pakai", callback_data="help_usage"), InlineKeyboardButton("🔄 Reset Saldo", callback_data="menu_reset"))
+    return text, markup
+
+def render_history_text(user):
+    if not user['history']:
+        return None
+    wins = len([t for t in user['history'] if t['net'] > 0])
+    losses = len(user['history']) - wins
+    wr = (wins / len(user['history'])) * 100
+    text = f"📜 **HISTORY TERAKHIR** (WR: {wr:.1f}% | W:{wins} L:{losses})\n\n"
+    for t in list(reversed(user['history']))[:10]:
+        text += f"{t['status']} **${t['symbol']}** | `{t['pct']:+.2f}%` | 💵 `{t['net']:+.2f}`\n"
+    return text
+
+def render_stats_text(user):
+    hist = user['history']
+    if not hist:
+        return None
+    wins = [t for t in hist if t['net'] > 0]
+    losses = [t for t in hist if t['net'] <= 0]
+    wr = (len(wins) / len(hist)) * 100
+    avg_hold = sum(t.get('hold_seconds', 0) for t in hist) / len(hist)
+    biggest_win = max(hist, key=lambda t: t['net'])
+    biggest_loss = min(hist, key=lambda t: t['net'])
+    text = (
+        f"📊 **STATISTIK TRADING**\n\n"
+        f"Total Trades: `{len(hist)}`\n"
+        f"Win Rate: `{wr:.1f}%` (W:{len(wins)} L:{len(losses)})\n"
+        f"Rata-rata Hold Time: `{format_duration(avg_hold)}`\n\n"
+        f"🏆 Biggest Win: ${biggest_win['symbol']} `{biggest_win['net']:+.2f} USDC`\n"
+        f"💀 Biggest Loss: ${biggest_loss['symbol']} `{biggest_loss['net']:+.2f} USDC`"
+    )
+    return text
+
+def render_alerts_list(user):
+    all_alerts = []
+    for addr, lst in user['alerts'].items():
+        for a in lst:
+            all_alerts.append((addr, a))
+    if not all_alerts:
+        return "🔕 Belum ada alert aktif.", None
+    text = "🔔 **ALERT AKTIF**\n\n"
+    markup = InlineKeyboardMarkup()
+    for addr, a in all_alerts:
+        arrow = "📈" if a['dir'] == 'up' else "📉"
+        text += f"{arrow} `{addr[:12]}...` target `${a['target']:.6f}`\n"
+        markup.add(InlineKeyboardButton(f"❌ Hapus #{a['id']}", callback_data=f"delal_{addr}_{a['id']}"))
     return text, markup
 
 # ================= COMMANDS =================
@@ -193,15 +302,32 @@ def cmd_scanner(message):
 @bot.message_handler(commands=['history'])
 def cmd_history(message):
     user = get_user(message.chat.id)
-    if not user['history']:
+    text = render_history_text(user)
+    if not text:
         bot.reply_to(message, "📭 Riwayat kosong.")
         return
-    wins = len([t for t in user['history'] if t['net'] > 0])
-    wr = (wins / len(user['history'])) * 100
-    text = f"📜 **HISTORY TERAKHIR** (WR: {wr:.1f}%)\n\n"
-    for t in list(reversed(user['history']))[:10]:
-        text += f"{t['status']} **${t['symbol']}** | `{t['pct']:+.2f}%` | 💵 `{t['net']:+.2f}`\n"
     bot.reply_to(message, text, parse_mode='Markdown')
+
+@bot.message_handler(commands=['stats'])
+def cmd_stats(message):
+    user = get_user(message.chat.id)
+    text = render_stats_text(user)
+    if not text:
+        bot.reply_to(message, "📭 Belum ada data trading.")
+        return
+    bot.reply_to(message, text, parse_mode='Markdown')
+
+@bot.message_handler(commands=['alerts'])
+def cmd_alerts(message):
+    user = get_user(message.chat.id)
+    text, markup = render_alerts_list(user)
+    bot.reply_to(message, text, parse_mode='Markdown', reply_markup=markup)
+
+@bot.message_handler(commands=['reset'])
+def cmd_reset(message):
+    markup = InlineKeyboardMarkup()
+    markup.row(InlineKeyboardButton("✅ Ya, reset", callback_data="confirmreset"), InlineKeyboardButton("❌ Batal", callback_data="cancelreset"))
+    bot.reply_to(message, "⚠️ Ini akan reset saldo, posisi, history, dan pengaturan kamu ke awal. Yakin?", reply_markup=markup)
 
 # ================= DIRECT CA PARSER =================
 
@@ -230,6 +356,8 @@ def handle_direct_ca(message):
         markup.row(InlineKeyboardButton("Buy $10", callback_data=f"buy_10_{text}"), InlineKeyboardButton("Buy $50", callback_data=f"buy_50_{text}"))
         markup.row(InlineKeyboardButton("Buy $100", callback_data=f"buy_100_{text}"), InlineKeyboardButton("Buy $500", callback_data=f"buy_500_{text}"))
         markup.row(InlineKeyboardButton("✏️ Custom Buy", callback_data=f"buycustom_new_{text}"))
+        markup.row(InlineKeyboardButton("📊 Chart", callback_data=f"chart_{text}"))
+        markup.row(InlineKeyboardButton("🔔 Alert Naik", callback_data=f"aup_{text}"), InlineKeyboardButton("🔔 Alert Turun", callback_data=f"adn_{text}"))
         bot.reply_to(message, msg, parse_mode='Markdown', reply_markup=markup)
 
 # ================= CUSTOM BUY INPUT =================
@@ -274,29 +402,82 @@ def process_custom_buy(message, address, page=0, sort_by="recent", is_dca=False)
 
     user['balance'] -= amount
 
-# ================= SELL LOGIC (dipakai manual & auto TP/SL) =================
+# ================= SETTINGS INPUT (custom TP/SL & preset jual & alert) =================
 
-def execute_sell(chat_id, user, address, sell_pct, notify=True):
+def process_custom_tp(message):
+    user = get_user(message.chat.id)
+    try:
+        val = float(message.text)
+        if val <= 0: raise ValueError
+        user['tp_pct'] = val
+        bot.reply_to(message, f"✅ Auto TP custom diatur ke {val}%")
+    except:
+        bot.reply_to(message, "❌ Nominal tidak valid.")
+
+def process_custom_sl(message):
+    user = get_user(message.chat.id)
+    try:
+        val = float(message.text)
+        if val <= 0: raise ValueError
+        user['sl_pct'] = val
+        bot.reply_to(message, f"✅ Auto SL custom diatur ke {val}%")
+    except:
+        bot.reply_to(message, "❌ Nominal tidak valid.")
+
+def process_set_presets(message):
+    user = get_user(message.chat.id)
+    try:
+        parts = [int(round(float(x.strip()))) for x in message.text.split(',')]
+        if len(parts) != 3 or any(p <= 0 or p > 100 for p in parts):
+            raise ValueError
+        user['sell_presets'] = parts
+        bot.reply_to(message, f"✅ Preset jual diatur ke: {', '.join(f'{p}%' for p in parts)}")
+    except:
+        bot.reply_to(message, "❌ Format salah. Kirim 3 angka dipisah koma, contoh: `25,50,75`", parse_mode='Markdown')
+
+def process_set_alert(message, address, direction):
+    user = get_user(message.chat.id)
+    try:
+        target = float(message.text)
+        if target <= 0: raise ValueError
+    except:
+        bot.reply_to(message, "❌ Harga tidak valid.")
+        return
+    user['alert_counter'] += 1
+    alert_id = user['alert_counter']
+    user['alerts'].setdefault(address, []).append({'id': alert_id, 'dir': direction, 'target': target})
+    arrow = "📈" if direction == "up" else "📉"
+    label = "naik ke atas" if direction == "up" else "turun ke bawah"
+    bot.reply_to(message, f"{arrow} Alert diset: notif saat harga {label} `${target:.6f}`", parse_mode='Markdown')
+
+# ================= SELL LOGIC (dipakai manual, sell initial & auto TP/SL) =================
+
+def execute_sell_raw(chat_id, user, address, t_sell, i_sell, label="SELL", notify=True):
     if address not in user['positions']:
         return None
     pos = user['positions'][address]
     token_data = get_dexscreener_data(address)
     cur_price = float(token_data.get('priceUsd', 0)) if token_data else pos['entry_usd']
 
-    frac = sell_pct / 100.0
-    t_sell, i_sell = pos['tokens'] * frac, pos['invested'] * frac
+    t_sell = min(t_sell, pos['tokens'])
+    i_sell = min(i_sell, pos['invested']) if pos['invested'] > 0 else i_sell
+
     profit = (t_sell * cur_price) - i_sell
     pnl_pct = (profit / i_sell) * 100 if i_sell else 0
     emoji = "🟩" if profit > 0 else "🟥"
+    hold_seconds = (datetime.now() - pos['time']).total_seconds()
 
     user['balance'] += (t_sell * cur_price)
-    user['history'].append({'symbol': pos['symbol'], 'status': emoji, 'pct': pnl_pct, 'net': profit, 'date': datetime.now().strftime('%d-%m-%Y')})
+    user['history'].append({
+        'symbol': pos['symbol'], 'status': emoji, 'pct': pnl_pct, 'net': profit,
+        'date': datetime.now().strftime('%d-%m-%Y'), 'hold_seconds': hold_seconds
+    })
 
-    msg = f"🔔 **SELL {sell_pct}% FILLED**\n\n🏷 **${pos['symbol']}**\n"
+    msg = f"🔔 **{label} FILLED**\n\n🏷 **${pos['symbol']}**\n"
     msg += get_realtime_metrics_text(token_data) + "\n\n"
     msg += f"📊 Profit/Loss: {emoji} `{pnl_pct:+.2f}%` (`{profit:+.2f} USDC`)\n"
 
-    if sell_pct == 100 or pos['tokens'] - t_sell <= 0.000001:
+    if t_sell >= pos['tokens'] - 0.000001:
         del user['positions'][address]
         msg += f"🪙 Sisa Balance: `0 {pos['symbol']}`"
     else:
@@ -307,6 +488,27 @@ def execute_sell(chat_id, user, address, sell_pct, notify=True):
     if notify:
         bot.send_message(chat_id, msg, parse_mode='Markdown')
     return pnl_pct
+
+def execute_sell(chat_id, user, address, sell_pct, notify=True):
+    pos = user['positions'].get(address)
+    if not pos:
+        return None
+    frac = sell_pct / 100.0
+    t_sell, i_sell = pos['tokens'] * frac, pos['invested'] * frac
+    return execute_sell_raw(chat_id, user, address, t_sell, i_sell, label=f"SELL {sell_pct}%", notify=notify)
+
+def execute_sell_initial(chat_id, user, address, notify=True):
+    """Jual sebagian token senilai modal yang tersisa (recoup capital),
+    sisanya jalan sebagai 'profit murni' / free-roll."""
+    pos = user['positions'].get(address)
+    if not pos:
+        return None
+    token_data = get_dexscreener_data(address)
+    cur_price = float(token_data.get('priceUsd', 0)) if token_data else pos['entry_usd']
+
+    i_sell = pos['invested']
+    t_sell = min(pos['tokens'], (i_sell / cur_price) if cur_price > 0 else pos['tokens'])
+    return execute_sell_raw(chat_id, user, address, t_sell, i_sell, label="SELL INITIAL (Balik Modal)", notify=notify)
 
 # ================= CALLBACKS =================
 
@@ -321,22 +523,42 @@ def handle_callback(call):
             bot.send_message(call.message.chat.id, text, parse_mode='Markdown', reply_markup=markup)
 
         elif data == "menu_history":
-            if not user['history']:
+            text = render_history_text(user)
+            if not text:
                 bot.answer_callback_query(call.id, "📭 Riwayat kosong.", show_alert=True)
                 return
-            wins = len([t for t in user['history'] if t['net'] > 0])
-            wr = (wins / len(user['history'])) * 100
-            text = f"📜 **HISTORY TERAKHIR** (WR: {wr:.1f}%)\n\n"
-            for t in list(reversed(user['history']))[:10]:
-                text += f"{t['status']} **${t['symbol']}** | `{t['pct']:+.2f}%` | 💵 `{t['net']:+.2f}`\n"
             bot.send_message(call.message.chat.id, text, parse_mode='Markdown')
+
+        elif data == "menu_stats":
+            text = render_stats_text(user)
+            if not text:
+                bot.answer_callback_query(call.id, "📭 Belum ada data trading.", show_alert=True)
+                return
+            bot.answer_callback_query(call.id)
+            bot.send_message(call.message.chat.id, text, parse_mode='Markdown')
+
+        elif data == "menu_alerts":
+            bot.answer_callback_query(call.id)
+            text, markup = render_alerts_list(user)
+            bot.send_message(call.message.chat.id, text, parse_mode='Markdown', reply_markup=markup)
+
+        elif data.startswith("delal_"):
+            parts = data.split('_')
+            address, alert_id = parts[1], int(parts[2])
+            if address in user['alerts']:
+                user['alerts'][address] = [a for a in user['alerts'][address] if a['id'] != alert_id]
+                if not user['alerts'][address]:
+                    del user['alerts'][address]
+            bot.answer_callback_query(call.id, "✅ Alert dihapus")
 
         elif data == "help_usage":
             text = ("📖 **Cara Pakai**\n\n"
                     "1️⃣ Paste Contract Address (CA) langsung ke chat untuk lihat harga & beli.\n"
                     "2️⃣ Gunakan /pnl untuk lihat & kelola posisi terbuka.\n"
                     "3️⃣ Aktifkan Scanner untuk dapat notifikasi token baru otomatis.\n"
-                    "4️⃣ Atur Auto TP/SL supaya posisi otomatis terjual saat target tercapai.")
+                    "4️⃣ Atur Auto TP/SL supaya posisi otomatis terjual saat target tercapai.\n"
+                    "5️⃣ Pakai Sell Initial untuk balikin modal, sisanya jadi profit murni.\n"
+                    "6️⃣ Set Alert harga buat notifikasi kapan pun tanpa perlu pantau terus.")
             bot.answer_callback_query(call.id)
             bot.send_message(call.message.chat.id, text, parse_mode='Markdown')
 
@@ -389,6 +611,7 @@ def handle_callback(call):
         elif data == "menu_settp":
             markup = InlineKeyboardMarkup()
             markup.row(*[InlineKeyboardButton(f"{p}%", callback_data=f"settp_{p}") for p in [25, 50, 75, 100, 200]])
+            markup.row(InlineKeyboardButton("✏️ Custom %", callback_data="customtp"))
             markup.row(InlineKeyboardButton("❌ Matikan Auto TP" if user['tp_on'] else "✅ Nyalakan Auto TP", callback_data="toggletp"))
             bot.answer_callback_query(call.id)
             bot.send_message(call.message.chat.id, f"⚙️ **Auto Take Profit**\nSaat ini: {user['tp_pct']}% ({'ON' if user['tp_on'] else 'OFF'})\nPilih target baru:", parse_mode='Markdown', reply_markup=markup)
@@ -396,9 +619,41 @@ def handle_callback(call):
         elif data == "menu_setsl":
             markup = InlineKeyboardMarkup()
             markup.row(*[InlineKeyboardButton(f"{p}%", callback_data=f"setsl_{p}") for p in [10, 20, 30, 50, 70]])
+            markup.row(InlineKeyboardButton("✏️ Custom %", callback_data="customsl"))
             markup.row(InlineKeyboardButton("❌ Matikan Auto SL" if user['sl_on'] else "✅ Nyalakan Auto SL", callback_data="togglesl"))
             bot.answer_callback_query(call.id)
             bot.send_message(call.message.chat.id, f"⚙️ **Auto Stop Loss**\nSaat ini: {user['sl_pct']}% ({'ON' if user['sl_on'] else 'OFF'})\nPilih batas baru:", parse_mode='Markdown', reply_markup=markup)
+
+        elif data == "menu_presets":
+            bot.answer_callback_query(call.id)
+            cur = ", ".join(f"{p}%" for p in user['sell_presets'])
+            msg = bot.send_message(call.message.chat.id, f"🎚 **Preset Jual Cepat**\nSaat ini: {cur}\n\nKirim 3 angka dipisah koma (contoh: `25,50,75`):", parse_mode='Markdown')
+            bot.register_next_step_handler(msg, process_set_presets)
+
+        elif data == "menu_reset":
+            markup = InlineKeyboardMarkup()
+            markup.row(InlineKeyboardButton("✅ Ya, reset", callback_data="confirmreset"), InlineKeyboardButton("❌ Batal", callback_data="cancelreset"))
+            bot.answer_callback_query(call.id)
+            bot.send_message(call.message.chat.id, "⚠️ Ini akan reset saldo, posisi, history, dan pengaturan kamu ke awal. Yakin?", reply_markup=markup)
+
+        elif data == "confirmreset":
+            username = user.get('username', 'Unknown')
+            users_db[call.message.chat.id] = default_user_data(username)
+            bot.answer_callback_query(call.id, "✅ Direset!")
+            bot.send_message(call.message.chat.id, "🔄 Saldo & data kamu sudah direset ke awal.")
+
+        elif data == "cancelreset":
+            bot.answer_callback_query(call.id, "Dibatalkan")
+
+        elif data == "customtp":
+            bot.answer_callback_query(call.id)
+            msg = bot.send_message(call.message.chat.id, "✏️ Kirim persen Take Profit custom (contoh: `35`):")
+            bot.register_next_step_handler(msg, process_custom_tp)
+
+        elif data == "customsl":
+            bot.answer_callback_query(call.id)
+            msg = bot.send_message(call.message.chat.id, "✏️ Kirim persen Stop Loss custom (contoh: `15`):")
+            bot.register_next_step_handler(msg, process_custom_sl)
 
         elif data.startswith("settp_"):
             user['tp_pct'] = float(data.split('_')[1])
@@ -416,6 +671,29 @@ def handle_callback(call):
             user['sl_on'] = not user['sl_on']
             bot.answer_callback_query(call.id, f"Auto SL {'AKTIF ✅' if user['sl_on'] else 'NONAKTIF ❌'}")
 
+        elif data.startswith("aup_") or data.startswith("adn_"):
+            direction = "up" if data.startswith("aup_") else "down"
+            address = data.split('_', 1)[1]
+            bot.answer_callback_query(call.id)
+            label = "naik ke atas" if direction == "up" else "turun ke bawah"
+            msg = bot.send_message(call.message.chat.id, f"🔔 Kirim target harga USD untuk alert {label} (contoh: `0.0025`):", parse_mode='Markdown')
+            bot.register_next_step_handler(msg, process_set_alert, address, direction)
+
+        elif data.startswith("chart_"):
+            address = data.split('_', 1)[1]
+            bot.answer_callback_query(call.id)
+            bot.send_chat_action(call.message.chat.id, 'upload_photo')
+            token_data = get_dexscreener_data(address)
+            if not token_data:
+                bot.send_message(call.message.chat.id, "⚠️ Data tidak tersedia untuk membuat chart.")
+                return
+            symbol = token_data.get('baseToken', {}).get('symbol', '???')
+            buf = generate_price_chart(token_data, symbol)
+            if buf:
+                bot.send_photo(call.message.chat.id, buf, caption=f"📊 Snapshot perubahan harga ${symbol}\n(bukan candle historis penuh — data dari perubahan 5m/1h/6h/24h)")
+            else:
+                bot.send_message(call.message.chat.id, "⚠️ Data perubahan harga tidak tersedia untuk token ini.")
+
         elif data.startswith("buycustom_"):
             parts = data.split('_')
             context = parts[1]
@@ -431,6 +709,17 @@ def handle_callback(call):
             parts = data.split('_')
             text, markup = render_pnl_page(user, int(parts[1]), parts[2] if len(parts) > 2 else "recent")
             bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode='Markdown', reply_markup=markup)
+
+        elif data.startswith("pnlrefresh_"):
+            parts = data.split('_')
+            page = int(parts[1])
+            sort_by = parts[2] if len(parts) > 2 else "recent"
+            text, markup = render_pnl_page(user, page, sort_by)
+            try:
+                bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode='Markdown', reply_markup=markup)
+                bot.answer_callback_query(call.id, "🔄 Harga diperbarui")
+            except Exception:
+                bot.answer_callback_query(call.id, "✅ Sudah yang terbaru")
 
         elif data.startswith("buy_") or data.startswith("dca_"):
             parts = data.split('_')
@@ -465,6 +754,22 @@ def handle_callback(call):
                 bot.edit_message_text(msg, call.message.chat.id, call.message.message_id, parse_mode='Markdown')
 
             user['balance'] -= amount
+
+        elif data.startswith("sinit_"):
+            parts = data.split('_')
+            address = parts[1]
+            page = int(parts[2]) if len(parts) > 2 else 0
+            sort_by = parts[3] if len(parts) > 3 else "recent"
+
+            if address not in user['positions']:
+                bot.answer_callback_query(call.id, "❌ Token sudah terjual.", show_alert=True)
+                return
+
+            execute_sell_initial(call.message.chat.id, user, address)
+
+            text, markup = render_pnl_page(user, page, sort_by)
+            if not markup and page > 0: text, markup = render_pnl_page(user, page - 1, sort_by)
+            bot.edit_message_text(text, call.message.chat.id, call.message.message_id, parse_mode='Markdown', reply_markup=markup)
 
         elif data.startswith("sell_"):
             parts = data.split('_')
@@ -517,6 +822,37 @@ def tp_sl_worker():
             log.exception(f"tp_sl_worker error: {e}")
         time.sleep(20)
 
+# ================= BACKGROUND: PRICE ALERTS =================
+
+def alert_worker():
+    while True:
+        try:
+            for chat_id, user in list(users_db.items()):
+                if not user.get('alerts'):
+                    continue
+                for address in list(user['alerts'].keys()):
+                    data = get_dexscreener_data(address)
+                    if not data:
+                        continue
+                    cur_price = float(data.get('priceUsd', 0))
+                    symbol = data.get('baseToken', {}).get('symbol', '???')
+                    remaining = []
+                    for a in user['alerts'][address]:
+                        triggered = (a['dir'] == 'up' and cur_price >= a['target']) or \
+                                    (a['dir'] == 'down' and cur_price <= a['target'])
+                        if triggered:
+                            arrow = "📈" if a['dir'] == 'up' else "📉"
+                            bot.send_message(chat_id, f"{arrow} **ALERT TERPICU**\n${symbol} sekarang `${cur_price:.6f}` (target `${a['target']:.6f}`)", parse_mode='Markdown')
+                        else:
+                            remaining.append(a)
+                    if remaining:
+                        user['alerts'][address] = remaining
+                    else:
+                        del user['alerts'][address]
+        except Exception as e:
+            log.exception(f"alert_worker error: {e}")
+        time.sleep(20)
+
 # ================= BACKGROUND: SCANNER =================
 
 def scanner_worker():
@@ -553,5 +889,6 @@ def scanner_worker():
 if __name__ == "__main__":
     threading.Thread(target=tp_sl_worker, daemon=True).start()
     threading.Thread(target=scanner_worker, daemon=True).start()
+    threading.Thread(target=alert_worker, daemon=True).start()
     log.info("Bot starting polling...")
     bot.infinity_polling()
